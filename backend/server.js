@@ -15,6 +15,8 @@ const express = require('express');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 const twilio = require('twilio');
+const { cert, getApps, initializeApp } = require('firebase-admin/app');
+const { getFirestore } = require('firebase-admin/firestore');
 const { generatePresentationFromGemini } = require('./services/geminiService');
 const { buildPptxBuffer, normalizePresentationFormulas } = require('./utils/pptGenerator');
 const execFileAsync = promisify(execFile);
@@ -22,6 +24,12 @@ const execFileAsync = promisify(execFile);
 const app = express();
 const PORT = process.env.PORT || 5000;
 const usersFile = path.resolve(__dirname, 'data/users.json');
+const firebaseConfigured = Boolean(
+  process.env.FIREBASE_PROJECT_ID
+  && process.env.FIREBASE_CLIENT_EMAIL
+  && process.env.FIREBASE_PRIVATE_KEY,
+);
+let usersCollection;
 const presentationStore = new Map();
 const presentationExpiryMs = 15 * 60 * 1000;
 const whatsappClient = process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN
@@ -59,13 +67,48 @@ function sanitizeMobile(value) {
 }
 
 async function readUsers() {
+  const collection = getUsersCollection();
+  if (collection) {
+    const snapshot = await collection.get();
+    return snapshot.docs.map((document) => document.data());
+  }
+
+  if (process.env.VERCEL) {
+    throw new Error('Firebase credentials are required for user accounts on Vercel.');
+  }
+
   if (!fs.existsSync(usersFile)) return [];
   return JSON.parse(fs.readFileSync(usersFile, 'utf8'));
 }
 
 async function writeUsers(users) {
+  const collection = getUsersCollection();
+  if (collection) {
+    const existingUsers = await collection.get();
+    const batch = collection.firestore.batch();
+    existingUsers.docs.forEach((document) => batch.delete(document.ref));
+    users.forEach((user) => batch.set(collection.doc(user.id), user));
+    await batch.commit();
+    return;
+  }
+
   fs.mkdirSync(path.dirname(usersFile), { recursive: true });
   fs.writeFileSync(usersFile, JSON.stringify(users, null, 2));
+}
+
+function getUsersCollection() {
+  if (!firebaseConfigured) return null;
+  if (!usersCollection) {
+    const firebaseApp = getApps()[0] || initializeApp({
+      credential: cert({
+        projectId: process.env.FIREBASE_PROJECT_ID,
+        clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+        privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
+      }),
+    });
+    usersCollection = getFirestore(firebaseApp).collection('users');
+  }
+  return usersCollection;
 }
 
 function hashPassword(password, salt = crypto.randomBytes(16).toString('hex')) {
@@ -118,7 +161,7 @@ app.get('/api/health', (req, res) => {
   res.json({
     ok: true,
     message: 'MG AI PPT Generator backend is running.',
-    userStore: 'local-file',
+    userStore: firebaseConfigured ? 'firebase' : process.env.VERCEL ? 'unconfigured' : 'local-file',
   });
 });
 
@@ -169,6 +212,9 @@ app.post('/api/auth/register', profileLimiter, async (req, res) => {
     res.status(201).json({ success: true, user: { name, mobile, role } });
   } catch (error) {
     console.error('Registration failed:', error);
+    if (error.message?.includes('Firebase credentials')) {
+      return res.status(503).json({ error: 'Account storage is not configured. Add Firebase credentials in the deployment environment.' });
+    }
     res.status(500).json({ error: 'Unable to create your account right now. Please try again.' });
   }
 });
@@ -186,6 +232,9 @@ app.post(['/api/auth/login', '/api/login'], profileLimiter, async (req, res) => 
     res.json({ success: true, user: { name: user.name, mobile: user.mobile, role: user.role } });
   } catch (error) {
     console.error('Login failed:', error);
+    if (error.message?.includes('Firebase credentials')) {
+      return res.status(503).json({ error: 'Account storage is not configured. Add Firebase credentials in the deployment environment.' });
+    }
     res.status(500).json({ error: 'Unable to log in right now. Please try again.' });
   }
 });
