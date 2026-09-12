@@ -74,6 +74,9 @@ async function getUsersCollection() {
 async function readUsers() {
   const usersCollection = await getUsersCollection();
   if (usersCollection) return usersCollection.find({}, { projection: { _id: 0 } }).toArray();
+  if (process.env.VERCEL) {
+    throw new Error('MONGODB_URI is required for user accounts on Vercel.');
+  }
   if (!fs.existsSync(usersFile)) return [];
   return JSON.parse(fs.readFileSync(usersFile, 'utf8'));
 }
@@ -137,7 +140,11 @@ function findOfficeConverter() {
 }
 
 app.get('/api/health', (req, res) => {
-  res.json({ ok: true, message: 'MG AI PPT Generator backend is running.' });
+  res.json({
+    ok: true,
+    message: 'MG AI PPT Generator backend is running.',
+    userStore: mongoClient ? 'mongodb' : process.env.VERCEL ? 'unconfigured' : 'local-file',
+  });
 });
 
 app.post('/api/auth/register', profileLimiter, async (req, res) => {
@@ -187,6 +194,12 @@ app.post('/api/auth/register', profileLimiter, async (req, res) => {
     res.status(201).json({ success: true, user: { name, mobile, role } });
   } catch (error) {
     console.error('Registration failed:', error);
+    if (error.message?.includes('MONGODB_URI')) {
+      return res.status(503).json({ error: 'Account storage is not configured. Add MONGODB_URI in the deployment environment.' });
+    }
+    if (error.name?.includes('Mongo') || error.message?.includes('Mongo')) {
+      return res.status(503).json({ error: 'Unable to connect to account storage. Check the MongoDB deployment settings.' });
+    }
     res.status(500).json({ error: 'Unable to create your account right now. Please try again.' });
   }
 });
@@ -204,6 +217,12 @@ app.post(['/api/auth/login', '/api/login'], profileLimiter, async (req, res) => 
     res.json({ success: true, user: { name: user.name, mobile: user.mobile, role: user.role } });
   } catch (error) {
     console.error('Login failed:', error);
+    if (error.message?.includes('MONGODB_URI')) {
+      return res.status(503).json({ error: 'Account storage is not configured. Add MONGODB_URI in the deployment environment.' });
+    }
+    if (error.name?.includes('Mongo') || error.message?.includes('Mongo')) {
+      return res.status(503).json({ error: 'Unable to connect to account storage. Check the MongoDB deployment settings.' });
+    }
     res.status(500).json({ error: 'Unable to log in right now. Please try again.' });
   }
 });
@@ -223,6 +242,12 @@ app.delete('/api/auth/account', profileLimiter, async (req, res) => {
     res.json({ success: true });
   } catch (error) {
     console.error('Account deletion failed:', error);
+    if (error.message?.includes('MONGODB_URI')) {
+      return res.status(503).json({ error: 'Account storage is not configured. Add MONGODB_URI in the deployment environment.' });
+    }
+    if (error.name?.includes('Mongo') || error.message?.includes('Mongo')) {
+      return res.status(503).json({ error: 'Unable to connect to account storage. Check the MongoDB deployment settings.' });
+    }
     res.status(500).json({ error: 'Unable to delete your account right now. Please try again.' });
   }
 });
