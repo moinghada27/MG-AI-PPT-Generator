@@ -1,0 +1,19 @@
+{
+  "name": "ai-ppt-generator-backend",
+  "version": "1.0.0",
+  "private": true,
+  "main": "server.js",
+  "scripts": {
+    "dev": "node --watch server.js",
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@google/genai": "^2.22.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.1",
+    "express": "^4.21.2",
+    "express-rate-limit": "^8.7.0",
+    "pptxgenjs": "^4.0.1",
+    "twilio": "^5.3.0"
+  }
+}
