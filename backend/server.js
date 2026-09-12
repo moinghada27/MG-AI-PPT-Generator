@@ -15,7 +15,7 @@ const express = require('express');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 const twilio = require('twilio');
-const { MongoClient } = require('mongodb');
+const { google } = require('googleapis');
 const { generatePresentationFromGemini } = require('./services/geminiService');
 const { buildPptxBuffer, normalizePresentationFormulas } = require('./utils/pptGenerator');
 const execFileAsync = promisify(execFile);
@@ -23,8 +23,9 @@ const execFileAsync = promisify(execFile);
 const app = express();
 const PORT = process.env.PORT || 5000;
 const usersFile = path.resolve(__dirname, 'data/users.json');
-const mongoClient = process.env.MONGODB_URI ? new MongoClient(process.env.MONGODB_URI) : null;
-let usersCollectionPromise;
+const driveFolderId = process.env.GOOGLE_DRIVE_FOLDER_ID || '179616no0-8CiJMiZCXDe-eaXnS6SwBhr';
+const driveConfigured = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL && process.env.GOOGLE_PRIVATE_KEY;
+let driveClient;
 const presentationStore = new Map();
 const presentationExpiryMs = 15 * 60 * 1000;
 const whatsappClient = process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN
@@ -61,36 +62,92 @@ function sanitizeMobile(value) {
   return String(value || '').replace(/\D/g, '');
 }
 
-async function getUsersCollection() {
-  if (!mongoClient) return null;
-  if (!usersCollectionPromise) {
-    usersCollectionPromise = mongoClient.connect().then((client) => (
-      client.db(process.env.MONGODB_DB || 'mg-ai-ppt-generator').collection('users')
-    ));
+function getDriveClient() {
+  if (!driveConfigured) return null;
+  if (!driveClient) {
+    const auth = new google.auth.JWT({
+      email: process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
+      key: process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n'),
+      scopes: ['https://www.googleapis.com/auth/drive'],
+    });
+    driveClient = google.drive({ version: 'v3', auth });
   }
-  return usersCollectionPromise;
+  return driveClient;
 }
 
 async function readUsers() {
-  const usersCollection = await getUsersCollection();
-  if (usersCollection) return usersCollection.find({}, { projection: { _id: 0 } }).toArray();
+  const drive = getDriveClient();
+  if (drive) {
+    return readDriveJson('users.json');
+  }
   if (process.env.VERCEL) {
-    throw new Error('MONGODB_URI is required for user accounts on Vercel.');
+    throw new Error('Google Drive credentials are required for user accounts on Vercel.');
   }
   if (!fs.existsSync(usersFile)) return [];
   return JSON.parse(fs.readFileSync(usersFile, 'utf8'));
 }
 
 async function writeUsers(users) {
-  const usersCollection = await getUsersCollection();
-  if (usersCollection) {
-    await usersCollection.deleteMany({});
-    if (users.length > 0) await usersCollection.insertMany(users);
+  const drive = getDriveClient();
+  if (drive) {
+    await writeDriveJson('users.json', users);
     return;
   }
 
   fs.mkdirSync(path.dirname(usersFile), { recursive: true });
   fs.writeFileSync(usersFile, JSON.stringify(users, null, 2));
+}
+
+async function readDriveJson(fileName) {
+  const drive = getDriveClient();
+  const files = await drive.files.list({
+    q: `'${driveFolderId}' in parents and name = '${fileName}' and trashed = false`,
+    fields: 'files(id)',
+    spaces: 'drive',
+    pageSize: 1,
+  });
+  if (files.data.files.length === 0) return [];
+
+  const response = await drive.files.get(
+    { fileId: files.data.files[0].id, alt: 'media' },
+    { responseType: 'json' },
+  );
+  return Array.isArray(response.data) ? response.data : [];
+}
+
+async function writeDriveJson(fileName, value) {
+  const drive = getDriveClient();
+  const files = await drive.files.list({
+    q: `'${driveFolderId}' in parents and name = '${fileName}' and trashed = false`,
+    fields: 'files(id)',
+    spaces: 'drive',
+    pageSize: 1,
+  });
+  const media = { mimeType: 'application/json', body: JSON.stringify(value, null, 2) };
+
+  if (files.data.files.length > 0) {
+    await drive.files.update({ fileId: files.data.files[0].id, media });
+    return;
+  }
+
+  await drive.files.create({
+    requestBody: { name: fileName, parents: [driveFolderId], mimeType: 'application/json' },
+    media,
+    fields: 'id',
+  });
+}
+
+async function recordLogin(user, request) {
+  if (!getDriveClient()) return;
+  const loginEvents = await readDriveJson('login-events.json');
+  loginEvents.push({
+    name: user.name,
+    mobile: user.mobile,
+    role: user.role,
+    loggedInAt: new Date().toISOString(),
+    ipAddress: request.ip,
+  });
+  await writeDriveJson('login-events.json', loginEvents);
 }
 
 function hashPassword(password, salt = crypto.randomBytes(16).toString('hex')) {
@@ -143,7 +200,7 @@ app.get('/api/health', (req, res) => {
   res.json({
     ok: true,
     message: 'MG AI PPT Generator backend is running.',
-    userStore: mongoClient ? 'mongodb' : process.env.VERCEL ? 'unconfigured' : 'local-file',
+    userStore: driveConfigured ? 'google-drive' : process.env.VERCEL ? 'unconfigured' : 'local-file',
   });
 });
 
@@ -194,11 +251,11 @@ app.post('/api/auth/register', profileLimiter, async (req, res) => {
     res.status(201).json({ success: true, user: { name, mobile, role } });
   } catch (error) {
     console.error('Registration failed:', error);
-    if (error.message?.includes('MONGODB_URI')) {
-      return res.status(503).json({ error: 'Account storage is not configured. Add MONGODB_URI in the deployment environment.' });
+    if (error.message?.includes('Google Drive credentials')) {
+      return res.status(503).json({ error: 'Account storage is not configured. Add Google Drive credentials in the deployment environment.' });
     }
-    if (error.name?.includes('Mongo') || error.message?.includes('Mongo')) {
-      return res.status(503).json({ error: 'Unable to connect to account storage. Check the MongoDB deployment settings.' });
+    if (error.name?.includes('Google') || error.message?.includes('Google') || error.message?.includes('Drive')) {
+      return res.status(503).json({ error: 'Unable to connect to Google Drive account storage. Check the deployment settings.' });
     }
     res.status(500).json({ error: 'Unable to create your account right now. Please try again.' });
   }
@@ -214,14 +271,15 @@ app.post(['/api/auth/login', '/api/login'], profileLimiter, async (req, res) => 
       return res.status(401).json({ error: 'Invalid mobile number or password.' });
     }
 
+    recordLogin(user, req).catch((error) => console.error('Login event storage failed:', error));
     res.json({ success: true, user: { name: user.name, mobile: user.mobile, role: user.role } });
   } catch (error) {
     console.error('Login failed:', error);
-    if (error.message?.includes('MONGODB_URI')) {
-      return res.status(503).json({ error: 'Account storage is not configured. Add MONGODB_URI in the deployment environment.' });
+    if (error.message?.includes('Google Drive credentials')) {
+      return res.status(503).json({ error: 'Account storage is not configured. Add Google Drive credentials in the deployment environment.' });
     }
-    if (error.name?.includes('Mongo') || error.message?.includes('Mongo')) {
-      return res.status(503).json({ error: 'Unable to connect to account storage. Check the MongoDB deployment settings.' });
+    if (error.name?.includes('Google') || error.message?.includes('Google') || error.message?.includes('Drive')) {
+      return res.status(503).json({ error: 'Unable to connect to Google Drive account storage. Check the deployment settings.' });
     }
     res.status(500).json({ error: 'Unable to log in right now. Please try again.' });
   }
@@ -242,11 +300,11 @@ app.delete('/api/auth/account', profileLimiter, async (req, res) => {
     res.json({ success: true });
   } catch (error) {
     console.error('Account deletion failed:', error);
-    if (error.message?.includes('MONGODB_URI')) {
-      return res.status(503).json({ error: 'Account storage is not configured. Add MONGODB_URI in the deployment environment.' });
+    if (error.message?.includes('Google Drive credentials')) {
+      return res.status(503).json({ error: 'Account storage is not configured. Add Google Drive credentials in the deployment environment.' });
     }
-    if (error.name?.includes('Mongo') || error.message?.includes('Mongo')) {
-      return res.status(503).json({ error: 'Unable to connect to account storage. Check the MongoDB deployment settings.' });
+    if (error.name?.includes('Google') || error.message?.includes('Google') || error.message?.includes('Drive')) {
+      return res.status(503).json({ error: 'Unable to connect to Google Drive account storage. Check the deployment settings.' });
     }
     res.status(500).json({ error: 'Unable to delete your account right now. Please try again.' });
   }
