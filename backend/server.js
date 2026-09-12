@@ -15,6 +15,7 @@ const express = require('express');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 const twilio = require('twilio');
+const { MongoClient } = require('mongodb');
 const { generatePresentationFromGemini } = require('./services/geminiService');
 const { buildPptxBuffer, normalizePresentationFormulas } = require('./utils/pptGenerator');
 const execFileAsync = promisify(execFile);
@@ -22,6 +23,8 @@ const execFileAsync = promisify(execFile);
 const app = express();
 const PORT = process.env.PORT || 5000;
 const usersFile = path.resolve(__dirname, 'data/users.json');
+const mongoClient = process.env.MONGODB_URI ? new MongoClient(process.env.MONGODB_URI) : null;
+let usersCollectionPromise;
 const presentationStore = new Map();
 const presentationExpiryMs = 15 * 60 * 1000;
 const whatsappClient = process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN
@@ -58,12 +61,31 @@ function sanitizeMobile(value) {
   return String(value || '').replace(/\D/g, '');
 }
 
-function readUsers() {
+async function getUsersCollection() {
+  if (!mongoClient) return null;
+  if (!usersCollectionPromise) {
+    usersCollectionPromise = mongoClient.connect().then((client) => (
+      client.db(process.env.MONGODB_DB || 'mg-ai-ppt-generator').collection('users')
+    ));
+  }
+  return usersCollectionPromise;
+}
+
+async function readUsers() {
+  const usersCollection = await getUsersCollection();
+  if (usersCollection) return usersCollection.find({}, { projection: { _id: 0 } }).toArray();
   if (!fs.existsSync(usersFile)) return [];
   return JSON.parse(fs.readFileSync(usersFile, 'utf8'));
 }
 
-function writeUsers(users) {
+async function writeUsers(users) {
+  const usersCollection = await getUsersCollection();
+  if (usersCollection) {
+    await usersCollection.deleteMany({});
+    if (users.length > 0) await usersCollection.insertMany(users);
+    return;
+  }
+
   fs.mkdirSync(path.dirname(usersFile), { recursive: true });
   fs.writeFileSync(usersFile, JSON.stringify(users, null, 2));
 }
@@ -141,21 +163,25 @@ app.post('/api/auth/register', profileLimiter, async (req, res) => {
       return res.status(400).json({ error: 'Password must be at least 8 characters.' });
     }
 
-    const users = readUsers();
+    const users = await readUsers();
     if (users.some((user) => user.mobile === mobile)) {
       return res.status(409).json({ error: 'An account with this mobile number already exists.' });
     }
 
     const { salt, hash } = hashPassword(password);
     users.push({ id: crypto.randomUUID(), name, mobile, role, passwordSalt: salt, passwordHash: hash, createdAt: new Date().toISOString() });
-    writeUsers(users);
+    await writeUsers(users);
 
     if (whatsappClient && process.env.WHATSAPP_FROM && process.env.WHATSAPP_TO) {
-      await whatsappClient.messages.create({
-        from: process.env.WHATSAPP_FROM,
-        to: process.env.WHATSAPP_TO,
-        body: [`New MG AI PPT Generator user`, `Name: ${name}`, `Mobile: +91 ${mobile}`, `Role: ${role}`, `Registered: ${new Date().toISOString()}`].join('\n'),
-      });
+      try {
+        await whatsappClient.messages.create({
+          from: process.env.WHATSAPP_FROM,
+          to: process.env.WHATSAPP_TO,
+          body: [`New MG AI PPT Generator user`, `Name: ${name}`, `Mobile: +91 ${mobile}`, `Role: ${role}`, `Registered: ${new Date().toISOString()}`].join('\n'),
+        });
+      } catch (notificationError) {
+        console.error('WhatsApp notification failed:', notificationError);
+      }
     }
 
     res.status(201).json({ success: true, user: { name, mobile, role } });
@@ -165,11 +191,11 @@ app.post('/api/auth/register', profileLimiter, async (req, res) => {
   }
 });
 
-app.post(['/api/auth/login', '/api/login'], profileLimiter, (req, res) => {
+app.post(['/api/auth/login', '/api/login'], profileLimiter, async (req, res) => {
   try {
     const mobile = sanitizeMobile(req.body?.mobile);
     const password = String(req.body?.password || '');
-    const user = readUsers().find((entry) => entry.mobile === mobile);
+    const user = (await readUsers()).find((entry) => entry.mobile === mobile);
 
     if (!user || !passwordsMatch(password, user.passwordSalt, user.passwordHash)) {
       return res.status(401).json({ error: 'Invalid mobile number or password.' });
@@ -182,18 +208,18 @@ app.post(['/api/auth/login', '/api/login'], profileLimiter, (req, res) => {
   }
 });
 
-app.delete('/api/auth/account', profileLimiter, (req, res) => {
+app.delete('/api/auth/account', profileLimiter, async (req, res) => {
   try {
     const mobile = sanitizeMobile(req.body?.mobile);
     const password = String(req.body?.password || '');
-    const users = readUsers();
+    const users = await readUsers();
     const user = users.find((entry) => entry.mobile === mobile);
 
     if (!user || !passwordsMatch(password, user.passwordSalt, user.passwordHash)) {
       return res.status(401).json({ error: 'Invalid password.' });
     }
 
-    writeUsers(users.filter((entry) => entry.mobile !== mobile));
+    await writeUsers(users.filter((entry) => entry.mobile !== mobile));
     res.json({ success: true });
   } catch (error) {
     console.error('Account deletion failed:', error);
