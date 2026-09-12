@@ -27,6 +27,17 @@ const steps = [
   'Your PPT is ready!',
 ];
 
+async function readApiResponse(response) {
+  const responseText = await response.text();
+  try {
+    return responseText ? JSON.parse(responseText) : {};
+  } catch {
+    throw new Error(response.ok
+      ? 'The server returned an invalid response.'
+      : `The API request failed (${response.status}). Please check the deployment API route.`);
+  }
+}
+
 function App() {
   const [form, setForm] = useState(initialForm);
   const [errors, setErrors] = useState({});
@@ -136,7 +147,7 @@ function App() {
           password: authForm.password,
         }),
       });
-      const data = await response.json();
+      const data = await readApiResponse(response);
 
       if (!response.ok) throw new Error(data.error || 'Unable to authenticate.');
 

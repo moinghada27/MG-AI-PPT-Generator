@@ -165,7 +165,7 @@ app.post('/api/auth/register', profileLimiter, async (req, res) => {
   }
 });
 
-app.post('/api/auth/login', profileLimiter, (req, res) => {
+app.post(['/api/auth/login', '/api/login'], profileLimiter, (req, res) => {
   try {
     const mobile = sanitizeMobile(req.body?.mobile);
     const password = String(req.body?.password || '');
